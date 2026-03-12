@@ -29,6 +29,14 @@ except Exception as _e:
 else:
     _IMPORT_ERROR = None
 
+try:
+    from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
+except Exception as _e2:
+    Qwen3ForcedAligner = None
+    _ALIGNER_IMPORT_ERROR = _e2
+else:
+    _ALIGNER_IMPORT_ERROR = None
+
 # ComfyUI model folder registration
 QWEN3_ASR_ROOT = os.path.join(folder_paths.models_dir, "Qwen3-ASR")
 os.makedirs(QWEN3_ASR_ROOT, exist_ok=True)
@@ -44,6 +52,7 @@ SUPPORTED_LANGUAGES = [
 ]
 
 _ASR_MODEL_CACHE = {}
+_ALIGNER_CACHE = {}
 _CONFIG_CACHE = {"mtime": None, "data": None}
 
 
@@ -395,6 +404,38 @@ def _load_cached_model(
     return model
 
 
+def _aligner_cache_key(
+    aligner_path: str,
+    dtype: torch.dtype,
+    device: torch.device,
+    attention: str,
+) -> tuple:
+    return (aligner_path, str(dtype), str(device), attention)
+
+
+def _load_cached_aligner(
+    aligner_path: str,
+    dtype: torch.dtype,
+    device: torch.device,
+    attention: str,
+):
+    key = _aligner_cache_key(aligner_path, dtype, device, attention)
+    cached = _ALIGNER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    aligner_kwargs = {
+        "dtype": dtype,
+        "device_map": str(device),
+    }
+    if attention != "auto":
+        aligner_kwargs["attn_implementation"] = attention
+
+    aligner = Qwen3ForcedAligner.from_pretrained(aligner_path, **aligner_kwargs)
+    _ALIGNER_CACHE[key] = aligner
+    return aligner
+
+
 def _format_srt_time(seconds: float) -> str:
     total_ms = max(0, int(round(seconds * 1000)))
     ms = total_ms % 1000
@@ -712,12 +753,136 @@ class AILab_Qwen3ASRSubtitle:
         return (text, subtitles, detected_lang, file_path)
 
 
+class AILab_Qwen3ForcedAlign:
+    @classmethod
+    def INPUT_TYPES(cls):
+        defaults = _get_defaults()
+        aligner_ids = _get_aligner_ids()
+        # Filter out "None" — aligner is required for this node
+        aligner_choices = [k for k in aligner_ids.keys() if k != "None"]
+        if not aligner_choices:
+            aligner_choices = ["Qwen/Qwen3-ForcedAligner-0.6B"]
+        return {
+            "required": {
+                "audio": ("AUDIO", {"tooltip": "Audio input to align."}),
+                "text": ("STRING", {"default": "", "multiline": True, "tooltip": "Transcript text to force-align against the audio."}),
+                "language": ([lang for lang in SUPPORTED_LANGUAGES if lang != "auto"], {"default": "English", "tooltip": "Language of the transcript (required, no auto-detect)."}),
+            },
+            "optional": {
+                "forced_aligner": (aligner_choices, {"default": defaults.get("forced_aligner", "Qwen/Qwen3-ForcedAligner-0.6B"), "tooltip": "Forced aligner model."}),
+                "precision": (["bf16", "fp16", "fp32"], {"default": defaults.get("precision", "bf16"), "tooltip": "Inference precision."}),
+                "attention": (["auto", "flash_attention_2", "sdpa", "eager"], {"default": defaults.get("attention", "auto"), "tooltip": "Attention backend override."}),
+                "unload_models": ("BOOLEAN", {"default": True, "tooltip": "Unload cached aligner model after inference."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("WORD_TIMESTAMPS",)
+    FUNCTION = "align"
+    CATEGORY = "🧪AILab/🎙️QwenASR"
+
+    def align(
+        self,
+        audio,
+        text="",
+        language="English",
+        forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
+        precision="bf16",
+        attention="auto",
+        unload_models=True,
+    ):
+        if Qwen3ForcedAligner is None:
+            raise RuntimeError(f"Qwen3ForcedAligner not available: {_ALIGNER_IMPORT_ERROR}")
+
+        text = (text or "").strip()
+        if not text:
+            return ("",)
+
+        device = model_management.get_torch_device()
+        dtype = _build_dtype(precision, device)
+
+        source = _get_defaults().get("source", "HuggingFace")
+        aligner_path = _resolve_model_path(forced_aligner, source)
+
+        audio_data = _normalize_audio(audio)
+        if audio_data is None:
+            return ("",)
+
+        wave, sr = audio_data
+        duration = len(wave) / sr
+
+        aligner = _load_cached_aligner(aligner_path, dtype, device, attention)
+
+        from qwen_asr.inference.utils import split_audio_into_chunks, MAX_FORCE_ALIGN_INPUT_SECONDS
+
+        if duration <= MAX_FORCE_ALIGN_INPUT_SECONDS:
+            # Short audio — align in one shot
+            results = aligner.align(audio=audio_data, text=text, language=language)
+            all_items = list(results[0])
+        else:
+            # Long audio — split into chunks and align each separately
+            chunks = split_audio_into_chunks(wave, sr, MAX_FORCE_ALIGN_INPUT_SECONDS)
+            words = text.split()
+            total_samples = len(wave)
+
+            all_items = []
+            word_start = 0
+
+            for i, (chunk_wav, offset_sec) in enumerate(chunks):
+                # Estimate which words belong to this chunk based on audio proportion
+                chunk_end_sample = int(round(offset_sec * sr)) + len(chunk_wav)
+                if i < len(chunks) - 1:
+                    word_end = round(len(words) * chunk_end_sample / total_samples)
+                    word_end = max(word_end, word_start)
+                else:
+                    word_end = len(words)
+
+                chunk_words = words[word_start:word_end]
+                if not chunk_words:
+                    continue
+
+                chunk_text = " ".join(chunk_words)
+                chunk_results = aligner.align(
+                    audio=(chunk_wav, sr),
+                    text=chunk_text,
+                    language=language,
+                )
+
+                # Apply time offset to chunk results
+                for item in chunk_results[0]:
+                    all_items.append(type(item)(
+                        text=item.text,
+                        start_time=round(item.start_time + offset_sec, 3),
+                        end_time=round(item.end_time + offset_sec, 3),
+                    ))
+
+                word_start = word_end
+
+        lines = []
+        for item in all_items:
+            word = (item.text or "").strip()
+            if word:
+                lines.append(f"{item.start_time:.2f}-{item.end_time:.2f}: {word}")
+        word_timestamps = "\n".join(lines)
+
+        if unload_models:
+            _ALIGNER_CACHE.clear()
+            try:
+                model_management.soft_empty_cache()
+            except Exception:
+                pass
+
+        return (word_timestamps,)
+
+
 NODE_CLASS_MAPPINGS = {
     "AILab_Qwen3ASR": AILab_Qwen3ASR,
     "AILab_Qwen3ASRSubtitle": AILab_Qwen3ASRSubtitle,
+    "AILab_Qwen3ForcedAlign": AILab_Qwen3ForcedAlign,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AILab_Qwen3ASR": "ASR (QwenASR)",
     "AILab_Qwen3ASRSubtitle": "Subtitle (QwenASR)",
+    "AILab_Qwen3ForcedAlign": "Forced Align (QwenASR)",
 }
